@@ -1,0 +1,15 @@
+{
+  "default_directory": "vents",
+  "summary_model": "",
+  "show_recent_vents": true,
+  "autocorrect_language": "en",
+  "keybindings": {
+    "commands": "ctrl+o",
+    "files": "ctrl+f",
+    "panes": "ctrl+p",
+    "autocorrect": "ctrl+t",
+    "settings": "none",
+    "copy": "none",
+    "help": "f1"
+  }
+}

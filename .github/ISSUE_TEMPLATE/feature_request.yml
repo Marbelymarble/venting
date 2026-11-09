@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest a focused improvement to Venting.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult today? Use synthetic examples.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy and data implications
+      description: Note any new files, network access, clipboard use, or content retention.
+    validations:
+      required: true
+

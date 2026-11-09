@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.coverage
+thoughts-*.txt
+vents/*
+!vents/.gitkeep
+.venting-settings-*
+/venting.json
+.venting-summaries/

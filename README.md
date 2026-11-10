@@ -1,5 +1,7 @@
 # Venting
 
+> **AI development disclosure:** This app was built entirely using AI coding.
+
 ## Why this exists
 
 Sometimes you just want to dump a thought somewhere and move on. Venting makes

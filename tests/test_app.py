@@ -37,6 +37,20 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.app.saved_count, 0)
         self.assertTrue(self.app.error)
 
+    def test_escape_saves_the_draft_and_returns_to_file_selection(self):
+        self.type("Save this on the way back")
+        self.app.handle("\x1b")
+        self.assertEqual(self.path.read_text(), "Save this on the way back\n")
+        self.assertEqual(self.app.draft.text, "")
+        self.assertTrue(self.app.chooser)
+
+    def test_escape_stays_in_the_writer_when_saving_fails(self):
+        self.type("Do not lose me")
+        with patch.object(self.app.file, "append", side_effect=OSError("disk full")):
+            self.app.handle("\x1b")
+        self.assertFalse(self.app.chooser)
+        self.assertEqual(self.app.draft.text, "Do not lose me")
+
     def test_preview_is_hidden_by_default_and_hiding_drops_cache(self):
         self.assertFalse(self.app.preview)
         self.app.handle("\x10")

@@ -52,7 +52,8 @@ autocorrect also works in a fresh install without downloads or system word lists
 
 - Enter in the venting pane appends and syncs the current thought immediately.
   Only a successful save clears the draft. Enter in the file editor inserts a
-  newline; Ctrl+S saves the full edited file without clearing it.
+  newline; Ctrl+S saves the full edited file without clearing it. Escape saves
+  pending file edits and the current thought, then returns to file selection.
 - The append path never truncates. Full-file saves are intentional editor actions
   and must compare the loaded revision before replacing the original atomically.
 - Start with only the venting field visible. Tab swaps the visible field

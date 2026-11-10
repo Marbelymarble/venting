@@ -56,6 +56,7 @@ venting ~/thoughts.txt         # append to an existing file
 | Ctrl+S | Save edits in the file editor |
 | Ctrl+T | Toggle autocorrect |
 | Tab | Switch between the visible fields or lists |
+| Esc | Save and return to file selection |
 | F1 | Open help |
 | Ctrl+Q / Ctrl+C | Quit |
 

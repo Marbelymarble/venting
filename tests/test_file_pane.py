@@ -37,6 +37,17 @@ class FilePaneTests(unittest.TestCase):
         self.assertEqual(self.app.file_editor.text, expected)
         self.assertFalse(self.app.file_dirty)
 
+    def test_escape_saves_file_edits_and_draft_before_returning_to_selection(self):
+        self.type("A draft")
+        self.open_editor()
+        self.type("A file edit")
+        self.app.handle("\x1b")
+        self.assertTrue(self.app.chooser)
+        self.assertEqual(self.path.read_text(),
+                         "First line\nSecond line\nA file edit\nA draft\n")
+        self.assertEqual(self.app.draft.text, "")
+        self.assertFalse(self.app.file_dirty)
+
     def test_edit_beginning_and_preserve_rest_of_file(self):
         self.open_editor()
         self.app.handle(DOC_HOME)

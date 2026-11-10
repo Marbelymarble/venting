@@ -530,7 +530,7 @@ class App:
         self.put(height - 4, 3, self.message,
                  "error" if self.error else "success", width=width - 6)
         self.put(height - 3, 2, "─" * (width - 4), "muted", width=width - 4)
-        self.put(height - 2, 2, f"{self.shortcut_label('files')} open/switch file · "
+        self.put(height - 2, 2, f"Esc save & file selection · {self.shortcut_label('files')} open/switch file · "
                  f"{self.shortcut_label('commands')} program menu", "muted")
         if self.file_focus:
             footer = ("Ctrl+S save file · Tab thought · " + self.shortcut_label("panes") +
@@ -620,6 +620,7 @@ class App:
                 f"{self.shortcut_label('files'):<12} Open or switch to an existing file",
                 f"{self.shortcut_label('autocorrect'):<12} Toggle thought autocorrect",
                 f"{self.shortcut_label('commands'):<12} Open the full program menu",
+                "Esc          Save and return to file selection",
                 "Recent vents E edit details · R redo summary",
                 '() [] {} ""  Auto-pair typed delimiters',
                 "Ctrl+Q/C quit; Esc closes this help",
@@ -1291,16 +1292,15 @@ class App:
         if self.chooser:
             self.handle_chooser(key)
             return
-        if self.shortcut("panes", key):
+        if key == "\x1b":
+            self.save_and_open_chooser()
+        elif self.shortcut("panes", key):
             if self.preview:
                 self.request("hide")
             else:
                 self.show_file_editor()
         elif key in ("\t", CTRL_TAB):
             self.switch_field()
-        elif key == "\x1b" and self.file_focus:
-            self.file_focus = False
-            self.note("Thought field active. Enter appends it to the file and clears the field.")
         elif self.shortcut("autocorrect", key):
             self.toggle_autocorrect()
         elif key == "\x13":
@@ -1513,6 +1513,13 @@ class App:
     def queue_summary(self) -> None:
         if self.summaries and self.file:
             self.summaries.submit((self.file.path,), priority=True)
+
+    def save_and_open_chooser(self) -> None:
+        if self.file_dirty and not self.save_file():
+            return
+        if self.draft.text and not self.save():
+            return
+        self.request("new_file")
 
     def request(self, action: str) -> None:
         self.pending = action

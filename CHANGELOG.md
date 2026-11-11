@@ -7,6 +7,10 @@ Versioning once public releases begin.
 
 ### Added
 
+- A Kitty graphics-protocol topic map shows weighted contextual connections,
+  persistent recent-timeframe filters, mouse selection, and source references.
+- A configurable global Topic map shortcut opens the same view from the file
+  browser or active venting view.
 - Recent vents use short local summaries as their labels.
 - Summary generation can be retried or force-redone with Ollama.
 - One edit sheet changes a vent's summary and filename or verifies deletion.
@@ -19,6 +23,8 @@ Versioning once public releases begin.
 
 ### Changed
 
+- The TUI and graph follow Kitty's active ANSI palette so system-generated
+  themes also style the app.
 - Tab switches directly between the path field and recent vents.
 - Summaries appear in the recent selector and file editor, not the venting pane.
 - The default shortcut presentation favors Ctrl keys; function keys remain

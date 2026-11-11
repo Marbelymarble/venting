@@ -105,7 +105,10 @@ autocorrect also works in a fresh install without downloads or system word lists
   cached summary; the worker still rechecks revisions and cache state. Render
   summaries in the recent selector and file-editor pane, never in the venting
   input pane. R must force-regenerate the selected summary even when its current
-  revision already has a valid cached result. Do not send content too thin to
+  revision already has a valid cached AI result. Manually written summaries persist
+  across file edits and renames; R requires explicit confirmation before replacing
+  one with an LLM result. In-flight results must not overwrite newer manual edits.
+  Do not send content too thin to
   summarize meaningfully. Treat journal text as untrusted model input and reject
   placeholder, prompt-echo, or instruction-like generated labels.
 - The Copy command copies the saved file only, without changing editor state, appending a

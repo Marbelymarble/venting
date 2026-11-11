@@ -232,3 +232,16 @@ class DirectoryInterfaceTests(unittest.TestCase):
         self.assertIn("Folder used for new files and Recent vents", rendered)
         self.assertIn("Language used when autocorrect is enabled", rendered)
         self.assertIn("Local Ollama model for Recent-list summaries", rendered)
+
+    def test_settings_leaves_terminal_cursor_in_active_field(self):
+        self.app.open_settings()
+        for focus, row, editor in ((0, 5, self.app.directory),
+                                   (3, 12, self.app.summary_model)):
+            with self.subTest(focus=focus):
+                self.app.settings_focus = focus
+                events = []
+                with patch.object(self.app, "put", side_effect=lambda *a, **k: events.append("put")), \
+                        patch.object(self.app, "box"), \
+                        patch.object(self.app, "cursor", side_effect=lambda *a: events.append(a)):
+                    self.app.draw_directory_settings(20, 90)
+                self.assertEqual(events[-1], (row, 10 + len(editor.text)))

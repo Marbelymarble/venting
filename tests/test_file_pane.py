@@ -240,6 +240,35 @@ class FilePaneTests(unittest.TestCase):
                             shown = file if focus else draft
                             self.assertEqual(shown.call_args.args, (5, 2, 19, width - 4))
 
+    def test_narrow_file_header_keeps_shortcuts_and_separates_summary_from_text(self):
+        self.open_editor()
+        self.app.handle(DOC_HOME)
+        original = self.app.file_editor.text
+        with patch.object(self.app, "put") as put, patch.object(self.app, "box"), \
+                patch.object(self.app, "cursor") as cursor, \
+                patch.object(self.app, "recent_summary", return_value="Long summary " * 12):
+            self.app.draw_preview(5, 2, 19, 40)
+        rows = {call.args[0]: call.args[2] for call in put.call_args_list}
+        self.assertIn("Ctrl+S save", " ".join(rows.values()))
+        self.assertIn("Tab thought", " ".join(rows.values()))
+        separator = next(y for y, text in rows.items() if text == "─" * 36)
+        self.assertTrue(rows[separator - 1].endswith("…"))
+        self.assertEqual(rows[separator + 1], "First line")
+        self.assertEqual(cursor.call_args.args, (separator + 1, 4))
+        self.assertEqual(self.app._file_rows, 5 + 19 - 1 - (separator + 1))
+        self.assertEqual(self.app.file_editor.text, original)
+
+    def test_short_file_pane_reserves_content_inside_bottom_border(self):
+        self.open_editor()
+        self.app.handle(DOC_HOME)
+        for height in (4, 5, 6, 8):
+            with self.subTest(height=height), patch.object(self.app, "put") as put, \
+                    patch.object(self.app, "box"), patch.object(self.app, "cursor"):
+                self.app.draw_preview(5, 2, height, 40)
+            rows = {call.args[0]: call.args[2] for call in put.call_args_list}
+            self.assertIn("First line", rows.values())
+            self.assertTrue(all(5 < row < 5 + height - 1 for row in rows))
+
 
 if __name__ == "__main__":
     unittest.main()

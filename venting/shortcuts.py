@@ -11,6 +11,7 @@ ACTION_LABELS = {
     "autocorrect": "Toggle autocorrect",
     "settings": "Default path & settings",
     "copy": "Copy saved file",
+    "topic_map": "Topic map",
     "help": "Help",
 }
 
@@ -21,6 +22,7 @@ DEFAULT_BINDINGS = {
     "autocorrect": "ctrl+t",
     "settings": "none",
     "copy": "none",
+    "topic_map": "ctrl+g",
     "help": "f1",
 }
 
@@ -55,7 +57,14 @@ def validate_bindings(values: object) -> dict[str, str]:
     if unknown:
         raise ValueError("Unknown shortcut action: " + sorted(unknown)[0])
     bindings = dict(DEFAULT_BINDINGS)
-    bindings.update({action: normalize_binding(value) for action, value in values.items()})
+    updates = {action: normalize_binding(value) for action, value in values.items()}
+    # Configurations written before Topic map existed may already assign its
+    # new default key to another action. Preserve that user's assignment and
+    # leave the new action menu-only until they choose a key for it.
+    if ("topic_map" not in values and
+            DEFAULT_BINDINGS["topic_map"] in updates.values()):
+        bindings["topic_map"] = "none"
+    bindings.update(updates)
     if bindings["commands"] == "none":
         raise ValueError("The Program menu needs a keyboard shortcut.")
     assigned = [binding for binding in bindings.values() if binding != "none"]

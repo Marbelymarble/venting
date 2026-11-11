@@ -131,6 +131,83 @@ class SummaryTests(unittest.TestCase):
         save_summary(self.path, current, "Thinking about X and figuring out Y.")
         self.assertIsNone(cached_summary(self.path, current))
 
+    def test_manual_summary_survives_edits_and_forced_background_requests(self):
+        self.path.write_text("A meaningful thought about tomorrow.")
+        save_summary(self.path, revision(self.path), "Thinking about X and figuring out Y.", manual=True)
+        self.path.write_text("An updated thought about tomorrow and next week.")
+        worker = SummaryWorker(DEFAULT_MODEL)
+        self.addCleanup(self.worker_cleanup, worker)
+        other = self.root / "other.md"
+        other.write_text("Another meaningful thought about work.")
+        with patch("venting.summaries.summarize", return_value="Work plans.") as model:
+            worker.submit([self.path, other], force=True)
+            self.wait_for(lambda: cached_summary(other, revision(other)) == "Work plans.")
+        model.assert_called_once_with("Another meaningful thought about work.", DEFAULT_MODEL)
+        self.assertEqual(cached_summary(self.path, revision(self.path)),
+                         "Thinking about X and figuring out Y.")
+
+    def test_manual_save_wins_over_an_inflight_ai_result(self):
+        self.path.write_text("A meaningful thought about tomorrow.")
+        worker = SummaryWorker(DEFAULT_MODEL)
+        self.addCleanup(self.worker_cleanup, worker)
+        entered, release = Event(), Event()
+        self.addCleanup(release.set)
+
+        def generate(*_):
+            entered.set()
+            release.wait(3)
+            return "AI result."
+
+        with patch("venting.summaries.summarize", side_effect=generate):
+            worker.submit([self.path])
+            self.assertTrue(entered.wait(2))
+            save_summary(self.path, revision(self.path), "My own words.", manual=True)
+            other = self.root / "other.md"
+            other.write_text("Another meaningful thought about work.")
+            worker.submit([other])
+            release.set()
+            self.wait_for(lambda: cached_summary(other, revision(other)) == "AI result.")
+        self.assertEqual(cached_summary(self.path, revision(self.path)), "My own words.")
+
+    def test_redo_manual_summary_requires_confirmation(self):
+        settings = Settings(self.root / "config.json")
+        settings.ensure_directory()
+        path = settings.default_directory / "journal.md"
+        path.write_text("A meaningful thought about tomorrow.")
+        save_summary(path, revision(path), "My own words.", manual=True)
+        app = App(settings=settings, enable_summaries=True)
+        self.addCleanup(self.worker_cleanup, app.summaries)
+        self.addCleanup(app.close)
+        app.recent = list_vents(settings.default_directory, exclude=settings.config_path)
+        app.recent_focus = True
+        with patch("venting.summaries.summarize", return_value="Tomorrow's plans.") as model:
+            app.handle_recent("r")
+            self.assertEqual(app.modal, "redo_manual_summary")
+            with patch.object(app, "put") as put, patch.object(app, "box"):
+                app.draw_modal(30, 100)
+            self.assertTrue(any("You wrote this summary" in call.args[2]
+                                for call in put.call_args_list))
+            app.handle("\n")
+            self.assertEqual(app.modal, "redo_manual_summary")
+            app.handle("\x1b")
+            model.assert_not_called()
+            self.assertEqual(cached_summary(path, revision(path)), "My own words.")
+            app.handle_recent("r")
+            app.handle("y")
+            self.wait_for(lambda: cached_summary(path, revision(path)) == "Tomorrow's plans.")
+        model.assert_called_once()
+
+    def test_confirmation_cannot_replace_a_newer_manual_edit(self):
+        from venting.summaries import manual_summary_token
+
+        self.path.write_text("A meaningful thought about tomorrow.")
+        current = revision(self.path)
+        save_summary(self.path, current, "My original words.", manual=True)
+        token = manual_summary_token(self.path)
+        save_summary(self.path, current, "My newer words.", manual=True)
+        save_summary(self.path, current, "AI result.", replace_manual=token)
+        self.assertEqual(cached_summary(self.path, current), "My newer words.")
+
     def test_snapshot_samples_long_utf8_input_and_rejects_binary(self):
         self.path.write_text("Start\n" + "🌿" * 5000 + "\nEnd", encoding="utf-8")
         text = snapshot(self.path, revision(self.path))

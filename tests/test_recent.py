@@ -3,12 +3,12 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from venting.app import App
 from venting.recent import list_vents
 from venting.settings import Settings
-from venting.summaries import cached_summary, metadata_path, revision, save_summary
+from venting.summaries import cached_summary, manual_summary_token, metadata_path, revision, save_summary
 
 
 class RecentTests(unittest.TestCase):
@@ -94,7 +94,8 @@ class RecentTests(unittest.TestCase):
     def test_recent_file_can_be_renamed_without_breaking_active_file_or_summary(self):
         original = self.directory / "original.txt"
         original.write_text("Original entry.\n")
-        save_summary(original, revision(original), "Thinking about names and figuring out a better one.")
+        save_summary(original, revision(original), "Thinking about names and figuring out a better one.",
+                     manual=True)
         old_metadata = metadata_path(original)
         self.app.open_path(str(original), create=False)
         self.app.handle("\x0e")
@@ -113,6 +114,7 @@ class RecentTests(unittest.TestCase):
         self.assertEqual(self.app.file.path, renamed.absolute())
         self.assertEqual(cached_summary(renamed, revision(renamed)),
                          "Thinking about names and figuring out a better one.")
+        self.assertIsNotNone(manual_summary_token(renamed))
         self.assertFalse(old_metadata.exists())
         self.assertEqual(self.app.message, "Renamed to renamed.md.")
         self.app.file.append("After rename")
@@ -175,6 +177,7 @@ class RecentTests(unittest.TestCase):
         self.app.handle("\n")
         self.assertEqual(cached_summary(source, revision(source)),
                          "Thinking manually about plans.")
+        self.assertIsNotNone(manual_summary_token(source))
         self.assertEqual(self.app.message, "Manual summary saved.")
 
         self.app.handle("e")
@@ -204,6 +207,63 @@ class RecentTests(unittest.TestCase):
         self.assertIn("Short label shown in Recent vents", rendered)
         self.assertIn("File name (same folder)", rendered)
         self.assertIn("Latest saved thought.", rendered)
+
+    def test_reload_manual_summary_requires_explicit_confirmation(self):
+        source = self.directory / "journal.txt"
+        source.write_text("A saved journal entry.")
+        sentence = "My own summary."
+        save_summary(source, revision(source), sentence, manual=True)
+        token = manual_summary_token(source)
+        self.app.prepare_default_directory()
+        self.app.handle("\t")
+        self.app.summaries = Mock()
+
+        for cancel in ("n", "\x1b"):
+            with self.subTest(cancel=cancel):
+                self.app.handle("R")
+                self.assertEqual(self.app.modal, "redo_manual_summary")
+                self.app.summaries.submit.assert_not_called()
+                self.app.handle("\n")
+                self.assertEqual(self.app.modal, "redo_manual_summary")
+                self.app.handle(cancel)
+                self.assertIsNone(self.app.modal)
+                self.app.summaries.submit.assert_not_called()
+                self.assertEqual(cached_summary(source, revision(source)), sentence)
+
+        self.app.handle("r")
+        self.app.handle("Y")
+        self.assertIsNone(self.app.modal)
+        self.app.summaries.submit.assert_called_once_with(
+            (source,), priority=True, retry=True, force=True, replace_manual=token)
+
+    def test_reload_ai_summary_does_not_require_confirmation(self):
+        source = self.directory / "journal.txt"
+        source.write_text("A saved journal entry.")
+        save_summary(source, revision(source), "Thinking about the day.")
+        self.app.prepare_default_directory()
+        self.app.handle("\t")
+        self.app.summaries = Mock()
+        self.app.handle("R")
+        self.assertIsNone(self.app.modal)
+        self.app.summaries.submit.assert_any_call(
+            (source,), priority=True, retry=True, force=True)
+
+    def test_edit_sheet_leaves_terminal_cursor_in_active_field(self):
+        source = self.directory / "journal.txt"
+        source.write_text("A saved journal entry.")
+        self.app.prepare_default_directory()
+        self.app.handle("\t")
+        self.app.handle("e")
+        for focus, row, editor in ((0, 7, self.app.edit_summary),
+                                   (1, 11, self.app.edit_name)):
+            with self.subTest(focus=focus):
+                self.app.edit_focus = focus
+                events = []
+                with patch.object(self.app, "put", side_effect=lambda *a, **k: events.append("put")), \
+                        patch.object(self.app, "box"), \
+                        patch.object(self.app, "cursor", side_effect=lambda *a: events.append(a)):
+                    self.app.draw_edit_vent(18, 80)
+                self.assertEqual(events[-1], (row, 5 + len(editor.text)))
 
     def test_picker_separates_guidance_from_shortcut_footer(self):
         self.app.prepare_default_directory()

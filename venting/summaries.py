@@ -11,7 +11,8 @@ from pathlib import Path
 import re
 import stat
 import tempfile
-from threading import Condition, Thread
+from threading import Condition, RLock, Thread
+from uuid import uuid4
 from typing import Iterable
 
 from .storage import stat_key
@@ -22,6 +23,7 @@ MAX_SUMMARY_CHARS = 140
 MIN_SUMMARY_ALNUM = 12
 METADATA_DIR = ".venting-summaries"
 Revision = tuple[int, int, int, int, int]
+_METADATA_LOCK = RLock()
 
 
 class OllamaError(Exception):
@@ -65,42 +67,65 @@ def placeholder_summary(sentence: str) -> bool:
     return any(re.search(pattern, value) for pattern in patterns)
 
 
-def cached_summary(path: Path, current: Revision) -> str | None:
+def _metadata(path: Path) -> dict:
     try:
         fd = os.open(metadata_path(path), os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(fd, encoding="utf-8") as source:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return None
+                return {}
             data = json.loads(source.read(4096))
-        if isinstance(data, dict) and data.get("revision") == list(current):
-            summary = data.get("summary")
-            if (isinstance(summary, str) and summary.strip()
-                    and len(summary) <= MAX_SUMMARY_CHARS
-                    and not placeholder_summary(summary)):
-                return summary
+        if isinstance(data, dict):
+            return data
     except (OSError, ValueError):
         pass
+    return {}
+
+
+def manual_summary_token(path: Path) -> str | None:
+    data = _metadata(path)
+    token = data.get("manual_token")
+    return token if isinstance(token, str) and token else None
+
+
+def cached_summary(path: Path, current: Revision) -> str | None:
+    data = _metadata(path)
+    manual = bool(data.get("manual_token"))
+    if manual or data.get("revision") == list(current):
+        summary = data.get("summary")
+        if (isinstance(summary, str) and summary.strip()
+                and len(summary) <= MAX_SUMMARY_CHARS
+                and (manual or not placeholder_summary(summary))):
+            return summary
     return None
 
 
-def save_summary(path: Path, current: Revision, sentence: str) -> None:
-    destination = metadata_path(path)
-    destination.parent.mkdir(mode=0o700, exist_ok=True)
-    if destination.parent.is_symlink():
-        raise OSError("Summary metadata directory cannot be a symlink.")
-    fd, name = tempfile.mkstemp(prefix=".summary-", dir=destination.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as target:
-            json.dump({"revision": list(current), "summary": sentence}, target, ensure_ascii=False)
-            target.write("\n")
-            target.flush()
-            os.fsync(target.fileno())
-        # Do not publish a summary for an older file revision.
-        if revision(path) == current:
-            os.replace(temporary, destination)
-    finally:
-        temporary.unlink(missing_ok=True)
+def save_summary(path: Path, current: Revision, sentence: str, *, manual: bool = False,
+                 replace_manual: str | None = None) -> None:
+    # Serialize manual saves with the final AI publication check, including
+    # results that were already in flight when the user edited the summary.
+    with _METADATA_LOCK:
+        token = manual_summary_token(path)
+        if not manual and token != replace_manual:
+            return
+        destination = metadata_path(path)
+        destination.parent.mkdir(mode=0o700, exist_ok=True)
+        if destination.parent.is_symlink():
+            raise OSError("Summary metadata directory cannot be a symlink.")
+        fd, name = tempfile.mkstemp(prefix=".summary-", dir=destination.parent)
+        temporary = Path(name)
+        try:
+            data = {"revision": list(current), "summary": sentence}
+            if manual:
+                data["manual_token"] = uuid4().hex
+            with os.fdopen(fd, "w", encoding="utf-8") as target:
+                json.dump(data, target, ensure_ascii=False)
+                target.write("\n")
+                target.flush()
+                os.fsync(target.fileno())
+            if revision(path) == current:
+                os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def snapshot(path: Path, current: Revision) -> str | None:
@@ -192,14 +217,14 @@ class SummaryWorker:
     def __init__(self, model: str):
         self.model = validate_model(model)
         self.condition = Condition()
-        self.pending: OrderedDict[Path, bool] = OrderedDict()
+        self.pending: OrderedDict[Path, tuple[bool, str | None]] = OrderedDict()
         self.failures: dict[Path, tuple[Revision, str]] = {}
         self.error = ""
         self.closed = False
         self.thread: Thread | None = None
 
     def submit(self, paths: Iterable[Path], *, priority: bool = False, retry: bool = False,
-               force: bool = False) -> None:
+               force: bool = False, replace_manual: str | None = None) -> None:
         with self.condition:
             if self.closed:
                 return
@@ -207,7 +232,8 @@ class SummaryWorker:
                 self.error = ""
                 self.failures.clear()
             for path in paths:
-                self.pending[path] = self.pending.get(path, False) or force
+                previous_force, previous_token = self.pending.get(path, (False, None))
+                self.pending[path] = (previous_force or force, replace_manual or previous_token)
                 if priority:
                     self.pending.move_to_end(path, last=False)
             if self.pending and self.thread is None:
@@ -232,11 +258,12 @@ class SummaryWorker:
                 self.condition.wait_for(lambda: self.closed or (self.pending and not self.error))
                 if self.closed:
                     return
-                path, force = self.pending.popitem(last=False)
+                path, (force, replace_manual) = self.pending.popitem(last=False)
             current = None
             try:
                 current = revision(path)
-                if (current[2] == 0 or (not force and cached_summary(path, current))
+                if (manual_summary_token(path) != replace_manual
+                        or current[2] == 0 or (not force and cached_summary(path, current))
                         or self.failure(path, current)):
                     continue
                 contents = snapshot(path, current)
@@ -251,11 +278,11 @@ class SummaryWorker:
                 with self.condition:
                     if self.closed:
                         return
-                save_summary(path, current, sentence)
+                save_summary(path, current, sentence, replace_manual=replace_manual)
             except OllamaError as error:
                 with self.condition:
                     if not self.closed:
-                        self.pending[path] = force
+                        self.pending[path] = (force, replace_manual)
                         self.error = str(error)
             except (OSError, ValueError) as error:
                 if current is not None:

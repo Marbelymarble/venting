@@ -5,6 +5,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import sys
+import textwrap
 
 from .autocorrect import Autocorrect, Correction, LANGUAGE_NAMES
 from .clipboard import copy_file
@@ -17,7 +18,9 @@ from .shortcuts import (ACTION_LABELS, DEFAULT_BINDINGS, binding_for_key, displa
                         key_for, validate_bindings)
 from .storage import Document, TextFile
 from .summaries import (DEFAULT_MODEL, MAX_SUMMARY_CHARS, SummaryWorker, cached_summary,
-                        metadata_path, revision, save_summary, snapshot)
+                        manual_summary_token, metadata_path, revision, save_summary, snapshot)
+from .topicmap import TopicGraph, TopicMapWorker, VALID_DAYS, graph_positions
+from . import kitty_graphics
 
 
 class App:
@@ -86,6 +89,17 @@ class App:
         self._paste: list[str] | None = None
         self._paste_tail = ""
         self.keyboard = KeyboardModes()
+        self.topic_worker: TopicMapWorker | None = None
+        self.topic_days = self.settings.topic_map_days
+        self.topic_selected = 0
+        self.topic_reference = 0
+        self.topic_reference_focus = False
+        self.topic_error = ""
+        self.topic_hitboxes: list[tuple[int, int, int, int, str, int]] = []
+        self.pending_reference: tuple[Path, str, int] | None = None
+        self._topic_image: tuple[bytes, int, int, int, int, int, int] | None = None
+        self._topic_image_key: object = None
+        self._topic_image_sent: object = None
         self._default_path()
 
     def _default_path(self) -> None:
@@ -134,6 +148,9 @@ class App:
             self.load_file_editor()
 
     def close(self) -> None:
+        kitty_graphics.clear()
+        if self.topic_worker:
+            self.topic_worker.close()
         if self.summaries:
             self.summaries.close()
         if self.file:
@@ -158,8 +175,8 @@ class App:
             background = curses.COLOR_BLACK
         colors = [curses.COLOR_CYAN, curses.COLOR_WHITE, curses.COLOR_WHITE,
                   curses.COLOR_RED, curses.COLOR_GREEN]
-        if curses.COLORS >= 256:
-            colors = [116, 245, 252, 210, 150]
+        # ANSI colors are deliberately used even in 256-color terminals: Kitty
+        # maps these through its live theme, including DMS-generated palettes.
         for index, (name, color) in enumerate(zip(self.palette, colors), 1):
             curses.init_pair(index, color, background)
             self.palette[name] = curses.color_pair(index)
@@ -171,6 +188,11 @@ class App:
         curses.raw()  # Ctrl+C is handled with the same draft guard as Ctrl+Q.
         curses.noecho()
         screen.keypad(True)
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+            curses.mouseinterval(0)
+        except curses.error:
+            pass
         screen.timeout(100)
         if hasattr(curses, "set_escdelay"):
             curses.set_escdelay(25)
@@ -307,6 +329,17 @@ class App:
         if self.modal:
             self.draw_modal(height, width)
         self.screen.refresh()
+        if self.modal == "topic_map" and self._topic_image:
+            pixels, pixel_width, pixel_height, y, x, rows, columns = self._topic_image
+            if self._topic_image_sent != self._topic_image_key:
+                if self._topic_image_sent is not None:
+                    kitty_graphics.clear()
+                kitty_graphics.display_rgba(pixels, pixel_width, pixel_height,
+                                            y, x, rows, columns)
+                self._topic_image_sent = self._topic_image_key
+        elif self._topic_image_sent is not None:
+            kitty_graphics.clear()
+            self._topic_image_sent = None
 
     def _draw_path(self, y: int, x: int, width: int, *, editor: Editor | None = None,
                    show_cursor: bool = True) -> None:
@@ -378,10 +411,10 @@ class App:
                   else "Tab recent vents · Ctrl+N create · " +
                   self.shortcut_label("files") + " open existing"), "muted")
         self.put(height - 1, 2,
-                 (f"Enter open selected · ↑/↓ select · Tab file path · {commands} menu"
+                 (f"Enter open · {self.shortcut_label('topic_map')} graph · ↑/↓ select · Tab path · {commands} menu"
                   if self.recent_focus else
-                  f"Enter {'create file' if self.create else 'open file'} · ↑/↓ matches · "
-                  f"{commands} program menu"), "muted")
+                  f"Enter {'create' if self.create else 'open'} · {self.shortcut_label('topic_map')} graph · "
+                  f"↑/↓ matches · {commands} menu"), "muted", width=width - 4)
         if self.recent_focus:
             try:
                 curses.curs_set(0)
@@ -405,6 +438,11 @@ class App:
         if self.summaries:
             if reload_selected and self.recent:
                 selected = self.recent[self.recent_index].path
+                token = manual_summary_token(selected)
+                if token:
+                    self.summary_redo = (selected, token)
+                    self.modal = "redo_manual_summary"
+                    return
                 self.summaries.submit((selected,), priority=True, retry=retry, force=True)
                 self.summaries.submit(vent.path for vent in self.recent if vent.path != selected)
                 self.note("Reloading summary: " + selected.name)
@@ -531,7 +569,7 @@ class App:
                  "error" if self.error else "success", width=width - 6)
         self.put(height - 3, 2, "─" * (width - 4), "muted", width=width - 4)
         self.put(height - 2, 2, f"Esc save & file selection · {self.shortcut_label('files')} open/switch file · "
-                 f"{self.shortcut_label('commands')} program menu", "muted")
+                 f"{self.shortcut_label('topic_map')} graph · {self.shortcut_label('commands')} program menu", "muted")
         if self.file_focus:
             footer = ("Ctrl+S save file · Tab thought · " + self.shortcut_label("panes") +
                       (" hide editor" if self.preview else " show both fields"))
@@ -574,15 +612,25 @@ class App:
         active = " · ACTIVE" if self.file_focus else ""
         self.box(y, x, height, width, "SAVED FILE CONTENT" + dirty + active + status)
         self._file_width = max(2, width - 4)
-        self.put(y + 1, x + 2, "Edit the whole file · Enter newline · Ctrl+S save · Tab thought",
-                 "muted", width=width - 4)
+        # Reserve a real text viewport before allocating header rows. In a
+        # narrow split, shortcuts wrap instead of being silently cut off.
+        header_budget = max(0, height - 3)
+        help_lines = textwrap.wrap("Enter newline · Ctrl+S save · Tab thought", self._file_width)
+        help_rows = min(len(help_lines), 2, header_budget)
+        for index, line in enumerate(help_lines[:help_rows]):
+            self.put(y + 1 + index, x + 2, line, "muted", width=self._file_width)
         summary = "RECENT-LIST SUMMARY · " + self.recent_summary(self.file.path)
-        summary_lines, _ = wrap(summary, self._file_width, 0)
-        summary_rows = min(len(summary_lines), 2 if height >= 8 else 1)
+        summary_lines = textwrap.wrap(summary, self._file_width)
+        summary_rows = min(len(summary_lines), 2, max(0, header_budget - help_rows - 1))
         for index, line in enumerate(summary_lines[:summary_rows]):
-            self.put(y + 2 + index, x + 2, line, "muted", width=width - 4)
-        self._file_rows = max(1, height - 4 - summary_rows)
-        content_y = y + 2 + summary_rows
+            if index == summary_rows - 1 and len(summary_lines) > summary_rows:
+                line = clip(line, self._file_width - 1) + "…"
+            self.put(y + 1 + help_rows + index, x + 2, line, "muted", width=self._file_width)
+        content_y = y + 1 + help_rows + summary_rows
+        if header_budget > help_rows + summary_rows:
+            self.put(content_y, x + 2, "─" * self._file_width, "muted", width=self._file_width)
+            content_y += 1
+        self._file_rows = max(1, y + height - 1 - content_y)
         if self.file_editor is None:
             self.put(content_y, x + 2, "File could not be loaded.", "error", width=width - 4)
             return
@@ -607,7 +655,15 @@ class App:
         if self.modal == "edit_vent":
             self.draw_edit_vent(height, width)
             return
-        if self.modal == "help":
+        if self.modal == "topic_map":
+            self.draw_topic_map(height, width)
+            return
+        if self.modal == "redo_manual_summary":
+            title = "REPLACE YOUR SUMMARY?"
+            lines = ["You wrote this summary yourself.",
+                     "Replace it with an LLM-generated summary?", "",
+                     "Y  Confirm and redo", "N / Esc  Keep your summary"]
+        elif self.modal == "help":
             title = "HELP · KEYS"
             lines = [
                 "Enter        Append thought; newline in file editor",
@@ -620,6 +676,7 @@ class App:
                 f"{self.shortcut_label('files'):<12} Open or switch to an existing file",
                 f"{self.shortcut_label('autocorrect'):<12} Toggle thought autocorrect",
                 f"{self.shortcut_label('commands'):<12} Open the full program menu",
+                f"{self.shortcut_label('topic_map'):<12} Open / close the graphical topic map",
                 "Esc          Save and return to file selection",
                 "Recent vents E edit details · R redo summary",
                 '() [] {} ""  Auto-pair typed delimiters',
@@ -641,6 +698,216 @@ class App:
             curses.curs_set(0)
         except curses.error:
             pass
+
+    def open_topic_map(self, *, force: bool = False) -> None:
+        """Open immediately; graph construction continues in the background."""
+        self.modal = "topic_map"
+        self.topic_selected = 0
+        self.topic_reference = 0
+        self.topic_reference_focus = False
+        self.topic_error = ""
+        self._topic_image_key = None
+        model = self.summaries.model if self.summaries else self.settings.summary_model
+        if not model:
+            self.topic_error = "Set a local Ollama model in Default path & settings first."
+            return
+        if (self.topic_worker is None or self.topic_worker.model != model or
+                self.topic_worker.directory != self.settings.default_directory):
+            if self.topic_worker:
+                self.topic_worker.close()
+            self.topic_worker = TopicMapWorker(self.settings.default_directory,
+                                               self.settings.config_path, model)
+        self.topic_worker.submit(self.topic_days, force=force)
+
+    @staticmethod
+    def _days_label(days: int) -> str:
+        return "all time" if days == 0 else f"last {days} days"
+
+    def draw_topic_map(self, height: int, width: int) -> None:
+        # Unlike compact dialogs, the topic map owns the entire viewport. Clear
+        # the chooser/writer first so their text and borders cannot bleed
+        # through the transparent Kitty image layer.
+        self.screen.erase()
+        self.topic_hitboxes = []
+        self.put(0, 2, "TOPIC MAP", "accent")
+        self.put(0, 14, "Local Ollama · " + self._days_label(self.topic_days), "muted",
+                 width=width - 16)
+        self.put(height - 2, 2,
+                 "T timeframe · R rebuild · Tab topics/references · arrows select · Enter open source",
+                 "muted", width=width - 4)
+        self.put(height - 1, 2, "Mouse: click a topic or source · Esc close", "muted",
+                 width=width - 4)
+        if self.topic_error:
+            self.box(2, 2, height - 5, width - 4, "GRAPH")
+            self.put(5, 5, self.topic_error, "error", width=width - 10)
+            self.put(7, 5, "The map only connects to Ollama on 127.0.0.1.", "muted",
+                     width=width - 10)
+            self._topic_image = None
+            return
+        if not self.topic_worker:
+            self._topic_image = None
+            return
+        loading, graph, error = self.topic_worker.state()
+        if error:
+            self.box(2, 2, height - 5, width - 4, "GRAPH")
+            self.put(5, 5, error, "error", width=width - 10)
+            self.put(7, 5, "Press R to retry, T to change timeframe, or Esc to close.",
+                     "muted", width=width - 10)
+            self._topic_image = None
+            return
+        if graph is None:
+            self.box(2, 2, height - 5, width - 4, "GRAPH")
+            self.put(5, 5, "Building a contextual map…", "accent")
+            self.put(7, 5, "You can close this view; analysis continues in the background.",
+                     "muted", width=width - 10)
+            self._topic_image = None
+            return
+        self.topic_selected = min(self.topic_selected, len(graph.topics) - 1)
+        topic = graph.topics[self.topic_selected]
+        self.topic_reference = min(self.topic_reference, len(topic.references) - 1)
+        reference_width = 38 if width >= 88 else max(24, width // 3)
+        graph_x, graph_y = 1, 2
+        graph_width, graph_height = width - reference_width - 3, height - 5
+        reference_x = graph_x + graph_width + 1
+        self.box(graph_y, graph_x, graph_height, graph_width,
+                 f"GRAPH · {len(graph.topics)} TOPICS · {graph.file_count} VENTS" +
+                 (" · UPDATING" if loading else ""))
+        self.box(graph_y, reference_x, graph_height, reference_width, "TEXT REFERENCES")
+        self.put(graph_y + 1, graph_x + 2, "Bubble area: passages · links: context", "muted",
+                 width=graph_width - 4)
+        inner_columns, inner_rows = max(1, graph_width - 4), max(1, graph_height - 3)
+        positions = graph_positions(graph, inner_columns, inner_rows)
+        absolute_positions = [(graph_x + 2 + x, graph_y + 1 + y) for x, y in positions]
+        if kitty_graphics.supported():
+            palette = kitty_graphics.kitty_palette()
+            cell_width_px, cell_height_px = kitty_graphics.cell_size()
+            key = (id(graph), self.topic_selected, inner_columns, inner_rows, palette,
+                   cell_width_px, cell_height_px)
+            if key != self._topic_image_key:
+                pixels = kitty_graphics.render_graph(graph, positions, inner_columns, inner_rows,
+                                                     self.topic_selected, palette=palette,
+                                                     cell_width=cell_width_px,
+                                                     cell_height=cell_height_px)
+                self._topic_image = (pixels, inner_columns * cell_width_px, inner_rows * cell_height_px,
+                                     graph_y + 1, graph_x + 2, inner_rows, inner_columns)
+                self._topic_image_key = key
+        else:
+            self._topic_image = None
+            self.put(graph_y + 2, graph_x + 3,
+                     "Graphical canvas requires Kitty; topics remain usable below.",
+                     "muted", width=graph_width - 6)
+        for index, ((x, y), item) in enumerate(zip(absolute_positions, graph.topics)):
+            label = clip(item.name, min(26, inner_columns))
+            label_width = cell_width(label)
+            start_x = max(graph_x + 2, min(x - label_width // 2,
+                                         graph_x + graph_width - label_width - 2))
+            label_y = min(y + 2, graph_y + graph_height - 2)
+            selected = index == self.topic_selected
+            self.put(label_y, start_x, label, "accent" if selected else "muted",
+                     width=graph_x + graph_width - start_x - 1)
+            self.topic_hitboxes.append((y - 1, min(x - 1, start_x), label_y,
+                                        max(x + 1, start_x + label_width - 1), "topic", index))
+        self.put(graph_y + 2, reference_x + 2, topic.name, "accent",
+                 width=reference_width - 4)
+        count = topic.frequency
+        vents = len({reference.path for reference in topic.references})
+        self.put(graph_y + 3, reference_x + 2,
+                 f"{count} passage{'s' if count != 1 else ''} · {vents} vent{'s' if vents != 1 else ''}", "muted",
+                 width=reference_width - 4)
+        row = graph_y + 5
+        for index, reference in enumerate(topic.references):
+            if row >= graph_y + graph_height - 2:
+                break
+            selected = self.topic_reference_focus and index == self.topic_reference
+            prefix = "› " if selected else "  "
+            self.put(row, reference_x + 2, prefix + reference.path.name,
+                     "accent" if selected else "text", width=reference_width - 4)
+            excerpt_lines, _ = wrap("“" + reference.excerpt + "”", reference_width - 6, 0)
+            shown = min(3, len(excerpt_lines), graph_y + graph_height - 2 - row)
+            for offset, line in enumerate(excerpt_lines[:shown], 1):
+                self.put(row + offset, reference_x + 4, line, "muted",
+                         width=reference_width - 6)
+            end = row + shown
+            self.topic_hitboxes.append((row, reference_x + 1, end,
+                                        reference_x + reference_width - 2, "reference", index))
+            row = end + 2
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+    def _open_topic_reference(self, graph: TopicGraph) -> None:
+        topic = graph.topics[self.topic_selected]
+        reference = topic.references[self.topic_reference]
+        self.pending_reference = (reference.path, reference.excerpt, reference.offset)
+        self.modal = None
+        self.request("topic_reference")
+
+    def handle_topic_map(self, key: str | int | tuple[str, str]) -> None:
+        if key == "\x1b" or self.shortcut("topic_map", key):
+            self.modal = None
+            return
+        if key in ("\x11", "\x03"):
+            self.modal = None
+            self.request("quit")
+            return
+        if key in ("t", "T"):
+            index = (VALID_DAYS.index(self.topic_days) + 1) % len(VALID_DAYS)
+            self.topic_days = VALID_DAYS[index]
+            try:
+                self.settings.set_topic_map_days(self.topic_days)
+            except OSError as error:
+                self.topic_error = "Could not save timeframe: " + str(error)
+                return
+            self.topic_selected = self.topic_reference = 0
+            self._topic_image_key = None
+            if self.topic_worker:
+                self.topic_worker.submit(self.topic_days)
+            return
+        if key in ("r", "R"):
+            if self.topic_worker:
+                self.topic_worker.submit(self.topic_days, force=True)
+            return
+        if key == "\t":
+            self.topic_reference_focus = not self.topic_reference_focus
+            return
+        if key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                return
+            if not state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED |
+                            curses.BUTTON1_RELEASED):
+                return
+            for top, left, bottom, right, kind, index in reversed(self.topic_hitboxes):
+                if top <= y <= bottom and left <= x <= right:
+                    if kind == "topic":
+                        self.topic_selected, self.topic_reference = index, 0
+                        self.topic_reference_focus = False
+                        self._topic_image_key = None
+                    else:
+                        self.topic_reference, self.topic_reference_focus = index, True
+                    return
+        if not self.topic_worker:
+            return
+        _, graph, _ = self.topic_worker.state()
+        if graph is None:
+            return
+        if key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_UP, curses.KEY_DOWN):
+            if self.topic_reference_focus:
+                count = len(graph.topics[self.topic_selected].references)
+                delta = -1 if key in (curses.KEY_LEFT, curses.KEY_UP) else 1
+                self.topic_reference = (self.topic_reference + delta) % count
+            else:
+                delta = -1 if key in (curses.KEY_LEFT, curses.KEY_UP) else 1
+                self.topic_selected = (self.topic_selected + delta) % len(graph.topics)
+                self.topic_reference = 0
+                self._topic_image_key = None
+        elif key in ("\n", "\r", curses.KEY_ENTER):
+            if self.topic_reference_focus:
+                self._open_topic_reference(graph)
+            else:
+                self.topic_reference_focus = True
 
     def shortcut(self, action: str, key: str | int | tuple[str, str]) -> bool:
         return key == key_for(self.settings.keybindings[action])
@@ -667,6 +934,7 @@ class App:
             ("panes", "P", "Show / hide file editor", not self.chooser),
             ("autocorrect", "A", "Autocorrect: " + autocorrect, True),
             ("settings", "D", "Default path & settings", True),
+            ("topic_map", "M", "Explore the graphical topic map", True),
             ("copy", "C", "Copy selected saved file", can_copy),
             ("shortcuts", "K", "Edit keyboard shortcuts", True),
             ("help", "H", "Help", True),
@@ -678,7 +946,7 @@ class App:
             self.draw_shortcut_editor(height, width)
             return
         options = self.command_options()
-        box_width, box_height = min(width - 4, 64), min(height, 15)
+        box_width, box_height = min(width - 4, 64), min(height, 16)
         y, x = (height - box_height) // 2, (width - box_width) // 2
         for row in range(y, y + box_height):
             self.put(row, x, " " * box_width)
@@ -743,7 +1011,7 @@ class App:
                 self.run_command(action)
             return
         hotkeys = {
-            "n": "new", "f": "files", "p": "panes", "a": "autocorrect",
+            "n": "new", "f": "files", "m": "topic_map", "p": "panes", "a": "autocorrect",
             "d": "settings", "s": "settings", "c": "copy", "k": "shortcuts",
             "h": "help", "q": "quit",
         }
@@ -758,6 +1026,8 @@ class App:
             self.command_error = ""
         elif action == "settings":
             self.open_settings()
+        elif action == "topic_map":
+            self.open_topic_map()
         elif action == "help":
             self.modal = "help"
         elif action == "copy":
@@ -868,10 +1138,12 @@ class App:
         self.put(y + 14, x + 2, self.edit_error, "error", width=box_width - 4)
         self.put(y + 16, x + 2, "Tab next · Enter save (delete row: twice) · Esc cancel", "muted",
                  width=box_width - 4)
-        self._draw_path(y + 7, x + 3, box_width - 6, editor=self.edit_summary,
-                        show_cursor=self.edit_focus == 0)
-        self._draw_path(y + 11, x + 3, box_width - 6, editor=self.edit_name,
-                        show_cursor=self.edit_focus == 1)
+        # Writing an inactive field also moves the terminal cursor. Draw the
+        # focused field last so the visible cursor stays where typing goes.
+        fields = [(0, y + 7, self.edit_summary), (1, y + 11, self.edit_name)]
+        for focus, row, editor in sorted(fields, key=lambda field: field[0] == self.edit_focus):
+            self._draw_path(row, x + 3, box_width - 6, editor=editor,
+                            show_cursor=self.edit_focus == focus)
         if self.edit_focus == 2:
             try:
                 curses.curs_set(0)
@@ -989,6 +1261,7 @@ class App:
                 self.edit_focus = 0
                 self.edit_error = f"Keep the summary to {MAX_SUMMARY_CHARS} characters."
                 return
+        was_manual = bool(manual_summary_token(source))
         target = source.with_name(name)
         if target != source and os.path.lexists(target):
             self.edit_focus = 1
@@ -1014,7 +1287,7 @@ class App:
         summarized = sentence != self.edit_original_summary
         try:
             if sentence:
-                save_summary(target, current, sentence)
+                save_summary(target, current, sentence, manual=summarized or was_manual)
         except (OSError, ValueError) as error:
             # The file rename has committed. Keep the sheet usable so the
             # summary can be retried against the new path without losing track
@@ -1118,10 +1391,10 @@ class App:
                  "muted", width=box_width - 4)
         self.put(y + 15, x + 2, "Summaries stay separate from vent files.",
                  "muted", width=box_width - 4)
-        self._draw_path(y + 4, x + 3, box_width - 6, editor=self.directory,
-                        show_cursor=self.settings_focus == 0)
-        self._draw_path(y + 11, x + 3, box_width - 6, editor=self.summary_model,
-                        show_cursor=self.settings_focus == 3)
+        fields = [(0, y + 4, self.directory), (3, y + 11, self.summary_model)]
+        for focus, row, editor in sorted(fields, key=lambda field: field[0] == self.settings_focus):
+            self._draw_path(row, x + 3, box_width - 6, editor=editor,
+                            show_cursor=self.settings_focus == focus)
         if self.settings_focus in (1, 2):
             try:
                 curses.curs_set(0)
@@ -1158,6 +1431,9 @@ class App:
                 if self.summaries:
                     self.summaries.close()
                 self.summaries = SummaryWorker(model) if model else None
+                if self.topic_worker:
+                    self.topic_worker.close()
+                    self.topic_worker = None
             if self.corrector and self.corrector.language != self.settings.autocorrect_language:
                 self.corrector = Autocorrect(self.settings.autocorrect_language)
             self.modal = None
@@ -1233,6 +1509,18 @@ class App:
         if key == curses.KEY_RESIZE:
             return
         if self.modal:
+            if self.modal == "redo_manual_summary":
+                if key in ("y", "Y"):
+                    path, token = self.summary_redo
+                    self.modal = None
+                    if self.summaries:
+                        self.summaries.submit((path,), priority=True, retry=True,
+                                              force=True, replace_manual=token)
+                        self.note("Reloading summary: " + path.name)
+                elif key in ("n", "N", "\x1b", "\x11", "\x03"):
+                    self.modal = None
+                    self.note("Kept your summary.")
+                return
             if self.modal == "commands":
                 self.handle_commands(key)
                 return
@@ -1241,6 +1529,9 @@ class App:
                 return
             if self.modal == "edit_vent":
                 self.handle_edit_vent(key)
+                return
+            if self.modal == "topic_map":
+                self.handle_topic_map(key)
                 return
             if self.modal == "help":
                 if key in ("\x1b", "\n", "\r") or self.shortcut("help", key):
@@ -1282,6 +1573,9 @@ class App:
             return
         if self.shortcut("copy", key) and ((self.chooser and self.recent) or not self.chooser):
             self.copy_saved_file()
+            return
+        if self.shortcut("topic_map", key):
+            self.open_topic_map()
             return
         if key == "\x0e":  # Ctrl+N is the conventional, fixed New-file action.
             self.request("new_file")
@@ -1545,6 +1839,24 @@ class App:
         elif action == "reload":
             if self.load_file_editor(reopen=True, keep_cursor=True):
                 self.note("File reloaded.")
+        elif action == "topic_reference" and self.pending_reference:
+            path, excerpt, offset = self.pending_reference
+            self.pending_reference = None
+            try:
+                self.open_path(str(path), create=False, guess_extension=False)
+                self.preview = True
+                if self.load_file_editor() and self.file_editor:
+                    first_word = excerpt.split()[0] if excerpt.split() else ""
+                    position = (offset if first_word and
+                                self.file_editor.text[offset:offset + len(first_word)].casefold()
+                                == first_word.casefold() else
+                                self.file_editor.text.casefold().find(excerpt.casefold()))
+                    if position >= 0:
+                        self.file_editor.cursor = position
+                self.file_focus = True
+                self.note("Opened topic reference: " + path.name)
+            except (OSError, ValueError) as error:
+                self.note("Could not open topic reference: " + str(error), error=True)
         elif action in ("new_file", "open_file", "file"):
             self.chooser = True
             self.file_focus = False

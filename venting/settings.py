@@ -8,6 +8,7 @@ import tempfile
 from .autocorrect import validate_language
 from .shortcuts import DEFAULT_BINDINGS, validate_bindings
 from .summaries import validate_model
+from .topicmap import validate_days
 
 
 def default_locations() -> tuple[Path, str]:
@@ -28,6 +29,7 @@ class Settings:
             "summary_model": "",
             "show_recent_vents": True,
             "autocorrect_language": "en",
+            "topic_map_days": 30,
             "keybindings": dict(DEFAULT_BINDINGS),
         }
 
@@ -51,6 +53,7 @@ class Settings:
         if not isinstance(settings.show_recent_vents, bool):
             raise ValueError("show_recent_vents must be true or false.")
         validate_language(settings.autocorrect_language)
+        validate_days(settings.topic_map_days)
         settings.values["keybindings"] = validate_bindings(settings.values.get("keybindings"))
         return settings
 
@@ -73,6 +76,10 @@ class Settings:
     @property
     def keybindings(self) -> dict[str, str]:
         return validate_bindings(self.values.get("keybindings"))
+
+    @property
+    def topic_map_days(self) -> int:
+        return self.values.get("topic_map_days", 30)
 
     def _resolve_directory(self, value: str) -> Path:
         if not isinstance(value, str) or not value.strip():
@@ -134,3 +141,6 @@ class Settings:
 
     def set_directory(self, value: str) -> None:
         self.set_preferences(value, self.summary_model, self.show_recent_vents)
+
+    def set_topic_map_days(self, days: int) -> None:
+        self._save(dict(self.values, topic_map_days=validate_days(days)))
